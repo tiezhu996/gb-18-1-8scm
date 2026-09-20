@@ -65,6 +65,59 @@ export interface PracticeSession {
   correct_count: number
 }
 
+/** 随机练习难度配额：简单/中等/困难三档需求题数 */
+export interface DifficultyQuota {
+  easy: number
+  medium: number
+  hard: number
+}
+
+/** 单档配额的实际执行结果（含补位进出） */
+export interface QuotaTierStat {
+  difficulty: 'easy' | 'medium' | 'hard'
+  demand: number
+  available: number
+  assigned: number
+  backfilled_in: number
+  backfilled_out: number
+}
+
+/** 配额抽题结果快照：创建成功后随会话返回 */
+export interface QuotaResult {
+  total: number
+  tiers: QuotaTierStat[]
+}
+
+/** 配额不足整批拒绝时，单档的需求/可用/缺口 */
+export interface QuotaShortageTier {
+  difficulty: 'easy' | 'medium' | 'hard'
+  demand: number
+  available: number
+  shortage: number
+}
+
+/** 配额不足整批拒绝的结构化错误详情 */
+export interface QuotaShortageDetail {
+  code: string
+  message: string
+  total: number
+  shortfall: number
+  tiers: QuotaShortageTier[]
+}
+
+/** 开始练习接口响应 */
+export interface StartPracticeResponse {
+  session_id: string
+  current_question: Question | null
+  progress: {
+    current: number
+    total: number
+    correct: number
+    accuracy: number
+  }
+  quota_result?: QuotaResult | null
+}
+
 export interface PracticeResult {
   question_id: string
   is_correct: boolean

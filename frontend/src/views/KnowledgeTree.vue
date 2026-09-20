@@ -106,7 +106,36 @@
             </van-radio-group>
           </div>
 
-          <div class="selector-item">
+          <div class="selector-item" v-if="selectedMode === 'random'">
+            <div class="selector-label quota-label">
+              <span>按难度配额抽题</span>
+              <van-switch v-model="useQuota" size="20px" />
+            </div>
+            <template v-if="useQuota">
+              <div
+                v-for="tier in quotaTiers"
+                :key="tier.key"
+                class="quota-row"
+              >
+                <span class="quota-name">{{ tier.label }}</span>
+                <van-stepper
+                  v-model="quota[tier.key]"
+                  min="0"
+                  max="50"
+                  integer
+                />
+              </div>
+              <div class="quota-summary">
+                三档合计 {{ quotaTotal }} 题，将作为本次练习总题数
+              </div>
+              <div class="quota-tip">
+                某档题目不足时，按 中等 → 简单 → 困难 顺序自动补位；
+                补足后仍缺题则整批拒绝并提示各档缺口
+              </div>
+            </template>
+          </div>
+
+          <div class="selector-item" v-if="selectedMode !== 'random' || !useQuota">
             <div class="selector-label">难度范围</div>
             <van-radio-group v-model="selectedDifficulty">
               <van-radio name="">全部难度</van-radio>
@@ -128,7 +157,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, computed } from 'vue'
+import { ref, reactive, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showLoadingToast, closeToast, showToast } from 'vant'
 import { getKnowledgeTree, searchKnowledge } from '@/api/knowledge'
@@ -153,6 +182,37 @@ const selectedMode = ref('')
 const selectedKnowledge = ref<KnowledgeNode | null>(null)
 const selectedCount = ref('10')
 const selectedDifficulty = ref('')
+
+// 随机练习：按难度配额抽题（简单/中等/困难三档）
+const useQuota = ref(true)
+const quota = reactive({ easy: 3, medium: 4, hard: 3 })
+const quotaTiers = [
+  { key: 'easy' as const, label: '简单' },
+  { key: 'medium' as const, label: '中等' },
+  { key: 'hard' as const, label: '困难' }
+]
+const quotaTotal = computed(() => quota.easy + quota.medium + quota.hard)
+
+// 切换题目数量时按比例重算三档默认值（余数给中间档）
+const distributeQuota = (total: number) => {
+  const base = Math.floor(total / 3)
+  quota.easy = base
+  quota.medium = base + (total - base * 3)
+  quota.hard = base
+}
+
+watch(selectedCount, (val) => {
+  distributeQuota(parseInt(val) || 0)
+})
+
+const startPractice = (mode: string) => {
+  selectedMode.value = mode
+  selectedKnowledge.value = null
+  if (mode === 'random') {
+    distributeQuota(parseInt(selectedCount.value) || 0)
+  }
+  showModeSelector.value = true
+}
 
 const fetchData = async () => {
   try {
@@ -210,25 +270,33 @@ const selectKnowledge = (node: KnowledgeNode) => {
     return
   }
   selectedKnowledge.value = node
-  showModeSelector.value = true
-}
-
-const startPractice = (mode: string) => {
-  selectedMode.value = mode
-  selectedKnowledge.value = null
+  if (selectedMode.value === 'random') {
+    distributeQuota(parseInt(selectedCount.value) || 0)
+  }
   showModeSelector.value = true
 }
 
 const confirmStartPractice = () => {
+  if (selectedMode.value === 'random' && useQuota.value && quotaTotal.value <= 0) {
+    showToast('三档题数之和必须大于 0')
+    return
+  }
   showModeSelector.value = false
 
+  const withQuota = selectedMode.value === 'random' && useQuota.value
   router.push({
     path: `/practice/${selectedMode.value}`,
     query: {
       subjectId: subjectId.value,
       knowledgeIds: selectedKnowledge.value?.id || '',
-      count: selectedCount.value,
-      difficulty: selectedDifficulty.value
+      // 配额模式下总题数取三档之和，保证与三档配额一致
+      count: withQuota ? String(quotaTotal.value) : selectedCount.value,
+      difficulty: withQuota ? '' : selectedDifficulty.value,
+      ...(withQuota && {
+        quotaEasy: String(quota.easy),
+        quotaMedium: String(quota.medium),
+        quotaHard: String(quota.hard)
+      })
     }
   })
 }
@@ -377,6 +445,37 @@ onMounted(() => {
   font-weight: 600;
   color: #1a1a2e;
   margin-bottom: 12px;
+}
+
+.quota-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.quota-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+}
+
+.quota-name {
+  font-size: 14px;
+  color: #334155;
+}
+
+.quota-summary {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #1d4ed8;
+}
+
+.quota-tip {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #94a3b8;
 }
 
 .selector-footer {

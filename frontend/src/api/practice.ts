@@ -1,5 +1,5 @@
 import request from './request'
-import type { Question, PracticeResult } from '@/types'
+import type { Question, PracticeResult, DifficultyQuota, StartPracticeResponse } from '@/types'
 
 export const startPractice = (data: {
   mode: string
@@ -7,12 +7,9 @@ export const startPractice = (data: {
   knowledge_ids?: string[]
   question_count: number
   difficulty?: string
+  difficulty_quota?: DifficultyQuota
 }) => {
-  return request.post<{
-    session_id: string
-    current_question: Question
-    progress: { current: number; total: number; correct: number; accuracy: number }
-  }>('/practice/start', data)
+  return request.post<StartPracticeResponse>('/practice/start', data)
 }
 
 export const submitAnswer = (sessionId: string, questionId: string, userAnswer: any) => {

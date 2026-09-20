@@ -1,10 +1,37 @@
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from bson import ObjectId
 from datetime import datetime
 import json
 from app.core.database import get_db
 from app.core.redis import get_redis
 from app.modules.questions.service import QuestionService
+from app.modules.practice.models import DifficultyQuota
+
+# 难度三档（展示/统计顺序）
+DIFFICULTY_TIERS = ["easy", "medium", "hard"]
+# 某档不足时的补位来源优先级：中等 → 简单 → 困难
+BACKFILL_PRIORITY = ["medium", "easy", "hard"]
+
+
+class QuotaShortageError(Exception):
+    """按难度配额组卷失败：补位后仍缺题，整批拒绝（不产生短会话）"""
+
+    def __init__(self, total: int, tiers: List[Dict[str, Any]]):
+        self.total = total
+        self.tiers = tiers
+        self.shortfall = max(0, total - sum(t["available"] for t in tiers))
+        super().__init__(
+            f"题目数量不足，无法按配额组卷：共需 {total} 题，补位后仍缺 {self.shortfall} 题"
+        )
+
+    def to_detail(self) -> Dict[str, Any]:
+        return {
+            "code": "QUOTA_SHORTAGE",
+            "message": str(self),
+            "total": self.total,
+            "shortfall": self.shortfall,
+            "tiers": self.tiers
+        }
 
 
 class PracticeService:
@@ -15,12 +42,23 @@ class PracticeService:
         subject_id: str,
         knowledge_ids: Optional[List[str]] = None,
         question_count: int = 20,
-        difficulty: Optional[str] = None
+        difficulty: Optional[str] = None,
+        difficulty_quota: Optional[DifficultyQuota] = None
     ) -> dict:
         db = get_db()
         redis = get_redis()
 
-        if mode == "random":
+        quota_result = None
+        if mode == "random" and difficulty_quota is not None:
+            # 按难度配额抽题：三档之和必须等于总题数，不足时按档补位，
+            # 补足后仍缺题则整批拒绝（抛 QuotaShortageError，不落库）
+            questions, quota_result = await PracticeService._draw_with_quota(
+                subject_id=subject_id,
+                knowledge_ids=knowledge_ids,
+                quota=difficulty_quota,
+                total=question_count
+            )
+        elif mode == "random":
             questions = await QuestionService.get_random_questions(
                 subject_id=subject_id,
                 knowledge_ids=knowledge_ids,
@@ -46,6 +84,7 @@ class PracticeService:
             "subject_id": subject_id,
             "knowledge_ids": knowledge_ids,
             "question_ids": question_ids,
+            "difficulty_quota": quota_result,
             "current_index": 0,
             "answers": {},
             "total": len(question_ids),
@@ -63,6 +102,137 @@ class PracticeService:
             await redis.setex(key, 3600 * 24, json.dumps(session_dict))
 
         return session_dict
+
+    @staticmethod
+    async def _draw_with_quota(
+        subject_id: str,
+        knowledge_ids: Optional[List[str]],
+        quota: DifficultyQuota,
+        total: int
+    ) -> Tuple[List[dict], dict]:
+        """按难度配额随机抽题。
+
+        规则：
+        1. 三档需求之和必须等于总题数，否则拒绝；
+        2. 每档先满足自身需求，某档不足时按 中等→简单→困难 顺序
+           从有余量的档补位；
+        3. 补足后仍缺题则整批拒绝（抛 QuotaShortageError），
+           不产生短会话或半个会话；
+        4. 同一会话题号不得重复。
+        """
+        db = get_db()
+        demands = {"easy": quota.easy, "medium": quota.medium, "hard": quota.hard}
+
+        if total <= 0:
+            raise ValueError("总题数必须大于 0")
+        if sum(demands.values()) != total:
+            raise ValueError(
+                f"简单({demands['easy']})、中等({demands['medium']})、"
+                f"困难({demands['hard']})三档之和必须等于总题数({total})"
+            )
+
+        base_query: Dict[str, Any] = {"subject_id": subject_id}
+        if knowledge_ids:
+            base_query["knowledge_ids"] = {"$in": knowledge_ids}
+
+        available = {}
+        for tier in DIFFICULTY_TIERS:
+            available[tier] = await db.questions.count_documents(
+                {**base_query, "difficulty": tier}
+            )
+
+        # 每档先满足自身需求，超出部分成为可补位余量
+        assigned = {t: min(demands[t], available[t]) for t in DIFFICULTY_TIERS}
+        surplus = {t: available[t] - assigned[t] for t in DIFFICULTY_TIERS}
+        backfilled_in = {t: 0 for t in DIFFICULTY_TIERS}
+        backfilled_out = {t: 0 for t in DIFFICULTY_TIERS}
+
+        # 某档不足时，按 中等→简单→困难 顺序从有余量的档补位
+        for tier in DIFFICULTY_TIERS:
+            deficit = demands[tier] - assigned[tier]
+            if deficit <= 0:
+                continue
+            for source in BACKFILL_PRIORITY:
+                if source == tier or surplus[source] <= 0:
+                    continue
+                moved = min(deficit, surplus[source])
+                assigned[source] += moved
+                surplus[source] -= moved
+                backfilled_out[source] += moved
+                backfilled_in[tier] += moved
+                deficit -= moved
+                if deficit == 0:
+                    break
+
+        # 补足后仍缺题：整批拒绝，返回每档需求、可用数和缺口
+        if sum(assigned.values()) < total:
+            tiers = [
+                {
+                    "difficulty": t,
+                    "demand": demands[t],
+                    "available": available[t],
+                    "shortage": max(0, demands[t] - available[t])
+                }
+                for t in DIFFICULTY_TIERS
+            ]
+            raise QuotaShortageError(total, tiers)
+
+        # 按各档最终配额随机抽题
+        questions: List[dict] = []
+        for tier in DIFFICULTY_TIERS:
+            if assigned[tier] <= 0:
+                continue
+            pipeline = [
+                {"$match": {**base_query, "difficulty": tier}},
+                {"$sample": {"size": assigned[tier]}}
+            ]
+            tier_questions = await db.questions.aggregate(pipeline).to_list(
+                length=assigned[tier]
+            )
+            questions.extend(tier_questions)
+
+        # 同一会话题号不得重复：跨档合并后去重保护
+        seen_ids = set()
+        unique_questions = []
+        for q in questions:
+            qid = str(q["_id"])
+            if qid in seen_ids:
+                continue
+            seen_ids.add(qid)
+            unique_questions.append(q)
+
+        # 并发下题库变动导致实际抽取不足，同样整批拒绝
+        if len(unique_questions) < total:
+            actual = {t: 0 for t in DIFFICULTY_TIERS}
+            for q in unique_questions:
+                if q.get("difficulty") in actual:
+                    actual[q["difficulty"]] += 1
+            tiers = [
+                {
+                    "difficulty": t,
+                    "demand": demands[t],
+                    "available": actual[t],
+                    "shortage": max(0, demands[t] - actual[t])
+                }
+                for t in DIFFICULTY_TIERS
+            ]
+            raise QuotaShortageError(total, tiers)
+
+        quota_result = {
+            "total": total,
+            "tiers": [
+                {
+                    "difficulty": t,
+                    "demand": demands[t],
+                    "available": available[t],
+                    "assigned": assigned[t],
+                    "backfilled_in": backfilled_in[t],
+                    "backfilled_out": backfilled_out[t]
+                }
+                for t in DIFFICULTY_TIERS
+            ]
+        }
+        return unique_questions, quota_result
 
     @staticmethod
     async def get_session(session_id: str, user_id: str) -> Optional[dict]:

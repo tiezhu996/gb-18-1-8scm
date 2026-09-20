@@ -36,7 +36,11 @@ request.interceptors.response.use(
   },
   (error) => {
     const status = error.response?.status
-    const message = error.response?.data?.detail || error.message || '请求失败'
+    const rawDetail = error.response?.data?.detail
+    // detail 可能是结构化对象（如配额不足明细），此时取其 message 字段
+    const message = typeof rawDetail === 'string'
+      ? rawDetail
+      : (rawDetail?.message || error.message || '请求失败')
 
     if (status === 401) {
       const userStore = useUserStore()

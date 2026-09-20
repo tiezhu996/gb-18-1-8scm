@@ -20,6 +20,28 @@
       </div>
     </div>
 
+    <div v-if="quotaResult" class="quota-result card">
+      <div class="quota-result-header">
+        <span class="quota-result-title">难度配额结果</span>
+        <van-icon name="cross" @click="quotaResult = null" />
+      </div>
+      <div
+        v-for="tier in quotaResult.tiers"
+        :key="tier.difficulty"
+        class="quota-result-row"
+      >
+        <span class="quota-tier-name">{{ tierName(tier.difficulty) }}</span>
+        <span class="quota-tier-nums">需求 {{ tier.demand }} → 实际 {{ tier.assigned }}</span>
+        <span v-if="tier.backfilled_in > 0" class="quota-tag in">
+          补入 {{ tier.backfilled_in }}
+        </span>
+        <span v-else-if="tier.backfilled_out > 0" class="quota-tag out">
+          补出 {{ tier.backfilled_out }}
+        </span>
+        <span v-else class="quota-tag ok">满足</span>
+      </div>
+    </div>
+
     <div class="question-container" v-if="currentQuestion && !isFinished">
       <div class="question-header">
         <span class="question-type">{{ questionTypeLabel }}</span>
@@ -151,9 +173,9 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { showConfirmDialog, showLoadingToast, closeToast } from 'vant'
+import { showConfirmDialog, showDialog, showLoadingToast, closeToast } from 'vant'
 import { startPractice, submitAnswer, navigateQuestion } from '@/api/practice'
-import type { Question, PracticeResult } from '@/types'
+import type { Question, PracticeResult, DifficultyQuota, QuotaResult, QuotaShortageDetail } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -177,6 +199,46 @@ const progress = reactive({
   correct: 0,
   accuracy: 0
 })
+
+// 难度配额抽题的实际执行结果（含补位明细），创建成功后展示
+const quotaResult = ref<QuotaResult | null>(null)
+
+const tierName = (difficulty: string) => {
+  const nameMap: Record<string, string> = {
+    easy: '简单',
+    medium: '中等',
+    hard: '困难'
+  }
+  return nameMap[difficulty] || difficulty
+}
+
+// 从路由 query 解析三档配额；参数不齐时不走配额模式
+const parseQuotaFromQuery = (): DifficultyQuota | undefined => {
+  if (mode.value !== 'random') return undefined
+  const { quotaEasy, quotaMedium, quotaHard } = query.value
+  if (quotaEasy === undefined || quotaMedium === undefined || quotaHard === undefined) {
+    return undefined
+  }
+  return {
+    easy: Math.max(0, parseInt(quotaEasy as string) || 0),
+    medium: Math.max(0, parseInt(quotaMedium as string) || 0),
+    hard: Math.max(0, parseInt(quotaHard as string) || 0)
+  }
+}
+
+// 配额不足被整批拒绝：展示每档需求、可用数和缺口，确认后返回设置页
+const showQuotaShortage = (detail: QuotaShortageDetail) => {
+  const tierLines = detail.tiers.map(
+    (t) => `${tierName(t.difficulty)}：需求 ${t.demand} / 可用 ${t.available} / 缺口 ${t.shortage}`
+  )
+  showDialog({
+    title: '题目数量不足，未创建练习',
+    message: [`共需 ${detail.total} 题，补位后仍缺 ${detail.shortfall} 题。`, ...tierLines].join('\n'),
+    confirmButtonText: '返回设置'
+  }).then(() => {
+    router.back()
+  })
+}
 
 const modeName = computed(() => {
   const modeMap: Record<string, string> = {
@@ -345,21 +407,32 @@ const initPractice = async () => {
   showLoadingToast({ message: '加载中...', duration: 0 })
   try {
     const knowledgeIds = query.value.knowledgeIds ? [query.value.knowledgeIds as string] : undefined
+    const quota = parseQuotaFromQuery()
 
     const startResult = await startPractice({
       mode: mode.value,
       subject_id: query.value.subjectId as string,
       knowledge_ids: knowledgeIds,
-      question_count: parseInt(query.value.count as string) || 20,
-      difficulty: (query.value.difficulty as string) || undefined
+      // 配额模式下总题数与三档之和保持一致
+      question_count: quota
+        ? quota.easy + quota.medium + quota.hard
+        : (parseInt(query.value.count as string) || 20),
+      difficulty: (query.value.difficulty as string) || undefined,
+      difficulty_quota: quota
     })
 
     sessionId.value = startResult.session_id
     currentQuestion.value = startResult.current_question
     progress.total = startResult.progress.total
     progress.current = startResult.progress.current
-  } catch (error) {
-    console.error(error)
+    quotaResult.value = startResult.quota_result || null
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail
+    if (detail && typeof detail === 'object' && detail.code === 'QUOTA_SHORTAGE') {
+      showQuotaShortage(detail as QuotaShortageDetail)
+    } else {
+      console.error(error)
+    }
   } finally {
     closeToast()
   }
@@ -394,6 +467,65 @@ onMounted(() => {
   margin-top: 8px;
   font-size: 12px;
   color: #64748b;
+}
+
+.quota-result {
+  margin: 12px 16px 0;
+  padding: 12px 16px;
+  background: white;
+  border-radius: 12px;
+}
+
+.quota-result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.quota-result-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1a1a2e;
+}
+
+.quota-result-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 13px;
+}
+
+.quota-tier-name {
+  width: 36px;
+  color: #334155;
+}
+
+.quota-tier-nums {
+  flex: 1;
+  color: #64748b;
+}
+
+.quota-tag {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 8px;
+}
+
+.quota-tag.in {
+  background: #fff7e6;
+  color: #d97706;
+}
+
+.quota-tag.out {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.quota-tag.ok {
+  background: #f0fdf4;
+  color: #15803d;
 }
 
 .question-container {

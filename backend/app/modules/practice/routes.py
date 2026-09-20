@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.modules.practice.models import PracticeConfig, PracticeSubmit
-from app.modules.practice.service import PracticeService
+from app.modules.practice.service import PracticeService, QuotaShortageError
 from app.modules.auth.dependencies import get_current_user
 
 router = APIRouter()
@@ -18,7 +18,8 @@ async def start_practice(
             subject_id=config.subject_id,
             knowledge_ids=config.knowledge_ids,
             question_count=config.question_count,
-            difficulty=config.difficulty
+            difficulty=config.difficulty,
+            difficulty_quota=config.difficulty_quota
         )
 
         question = await PracticeService.get_current_question(session)
@@ -39,8 +40,13 @@ async def start_practice(
                 "total": session["total"],
                 "correct": 0,
                 "accuracy": 0
-            }
+            },
+            # 难度配额的实际执行结果（含补位明细），无配额时为 None
+            "quota_result": session.get("difficulty_quota")
         }
+    except QuotaShortageError as e:
+        # 整批拒绝：返回每档需求、可用数和缺口，不产生任何会话
+        raise HTTPException(status_code=400, detail=e.to_detail())
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
