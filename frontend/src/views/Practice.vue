@@ -18,6 +18,37 @@
         <span>正确率 {{ progress.accuracy }}%</span>
         <span>已对 {{ progress.correct }} 题</span>
       </div>
+
+      <!-- 按难度配额创建的会话：展示各档实际抽中与补位结果快照 -->
+      <div v-if="quotaReport" class="quota-banner">
+        <div class="quota-banner-title">
+          难度配额结果
+          <span class="quota-toggle" @click="showQuotaDetail = !showQuotaDetail">
+            {{ showQuotaDetail ? '收起' : '查看补位' }}
+          </span>
+        </div>
+        <div class="quota-banner-summary">
+          <span v-for="item in quotaRows" :key="item.level">
+            {{ item.label }} {{ quotaReport.levels[item.level].allocated }} 题
+            <em v-if="quotaReport.levels[item.level].filled">
+              （补入 {{ quotaReport.levels[item.level].filled }}）
+            </em>
+          </span>
+        </div>
+        <div v-if="showQuotaDetail" class="quota-banner-detail">
+          <div v-if="quotaReport.transfers.length === 0" class="quota-muted">
+            三档均按需求抽满，未发生补位
+          </div>
+          <div
+            v-for="(transfer, i) in quotaReport.transfers"
+            :key="i"
+            class="quota-transfer"
+          >
+            {{ difficultyName(transfer.from_difficulty) }} 有余量，补
+            {{ difficultyName(transfer.to_difficulty) }} {{ transfer.count }} 题
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="question-container" v-if="currentQuestion && !isFinished">
@@ -152,8 +183,13 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showConfirmDialog, showLoadingToast, closeToast } from 'vant'
-import { startPractice, submitAnswer, navigateQuestion } from '@/api/practice'
-import type { Question, PracticeResult } from '@/types'
+import {
+  startPractice,
+  submitAnswer,
+  navigateQuestion,
+  getPracticeSession
+} from '@/api/practice'
+import type { Question, PracticeResult, DifficultyLevel, QuotaReport } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -170,6 +206,25 @@ const showResult = ref(false)
 const result = ref<PracticeResult | null>(null)
 const isFinished = ref(false)
 const submitting = ref(false)
+
+// 按难度配额创建的会话快照（成功后按题号快照继续，不重新抽题）
+const quotaReport = ref<QuotaReport | null>(null)
+const showQuotaDetail = ref(false)
+
+const quotaRows = [
+  { level: 'easy' as DifficultyLevel, label: '简单' },
+  { level: 'medium' as DifficultyLevel, label: '中等' },
+  { level: 'hard' as DifficultyLevel, label: '困难' }
+]
+
+const difficultyName = (level: DifficultyLevel) => {
+  const map: Record<DifficultyLevel, string> = {
+    easy: '简单',
+    medium: '中等',
+    hard: '困难'
+  }
+  return map[level]
+}
 
 const progress = reactive({
   current: 0,
@@ -341,9 +396,36 @@ const goHome = () => {
   router.push('/')
 }
 
+const applySessionSnapshot = (
+  startResult: {
+    session_id: string
+    current_question: Question | null
+    progress: { current: number; total: number }
+    quota_report?: QuotaReport
+  }
+) => {
+  sessionId.value = startResult.session_id
+  currentQuestion.value = startResult.current_question
+  progress.total = startResult.progress.total
+  progress.current = startResult.progress.current
+  quotaReport.value = startResult.quota_report || null
+}
+
 const initPractice = async () => {
   showLoadingToast({ message: '加载中...', duration: 0 })
   try {
+    // 配额入口（或任何带 sessionId 的入口）：按已创建的题号快照继续，不重新抽题
+    if (query.value.sessionId) {
+      const sessionResult = await getPracticeSession(query.value.sessionId as string)
+      sessionId.value = query.value.sessionId as string
+      currentQuestion.value = sessionResult.current_question
+      progress.total = sessionResult.session.total
+      progress.current = sessionResult.session.current_index
+      progress.correct = sessionResult.session.correct_count || 0
+      quotaReport.value = sessionResult.session.quota || null
+      return
+    }
+
     const knowledgeIds = query.value.knowledgeIds ? [query.value.knowledgeIds as string] : undefined
 
     const startResult = await startPractice({
@@ -354,10 +436,7 @@ const initPractice = async () => {
       difficulty: (query.value.difficulty as string) || undefined
     })
 
-    sessionId.value = startResult.session_id
-    currentQuestion.value = startResult.current_question
-    progress.total = startResult.progress.total
-    progress.current = startResult.progress.current
+    applySessionSnapshot(startResult)
   } catch (error) {
     console.error(error)
   } finally {
@@ -394,6 +473,51 @@ onMounted(() => {
   margin-top: 8px;
   font-size: 12px;
   color: #64748b;
+}
+
+.quota-banner {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.quota-banner-title {
+  font-weight: 600;
+  color: #0369a1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.quota-toggle {
+  font-weight: normal;
+  color: #3b82f6;
+}
+
+.quota-banner-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 6px;
+  color: #334155;
+}
+
+.quota-banner-summary em {
+  font-style: normal;
+  color: #16a34a;
+}
+
+.quota-banner-detail {
+  margin-top: 6px;
+  color: #1d4ed8;
+  line-height: 1.8;
+}
+
+.quota-muted {
+  color: #94a3b8;
 }
 
 .question-container {

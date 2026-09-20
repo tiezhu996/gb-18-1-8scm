@@ -2,9 +2,24 @@ from typing import Optional, List, Dict, Any
 from bson import ObjectId
 from datetime import datetime
 import json
+import random
 from app.core.database import get_db
 from app.core.redis import get_redis
 from app.modules.questions.service import QuestionService
+
+
+# 难度三档
+DIFFICULTY_LEVELS = ("easy", "medium", "hard")
+# 某档不足时，从有余量的档补位的优先级：中等 → 简单 → 困难
+FILL_ORDER = ("medium", "easy", "hard")
+
+
+class QuotaShortageError(Exception):
+    """配额无法补足时整批拒绝，携带每档需求、可用数和缺口。"""
+
+    def __init__(self, detail: dict):
+        self.detail = detail
+        super().__init__(detail.get("message", "题目数量不足，无法按配额创建练习"))
 
 
 class PracticeService:
@@ -15,12 +30,28 @@ class PracticeService:
         subject_id: str,
         knowledge_ids: Optional[List[str]] = None,
         question_count: int = 20,
-        difficulty: Optional[str] = None
+        difficulty: Optional[str] = None,
+        easy_count: Optional[int] = None,
+        medium_count: Optional[int] = None,
+        hard_count: Optional[int] = None
     ) -> dict:
+        quota_counts = PracticeService._parse_quota_counts(
+            mode, question_count, easy_count, medium_count, hard_count
+        )
+
         db = get_db()
         redis = get_redis()
 
-        if mode == "random":
+        quota_snapshot: Optional[dict] = None
+        if quota_counts is not None:
+            # 随机练习按难度配额抽题：不足档按 中等→简单→困难 顺序补位，
+            # 仍不足则整批拒绝，绝不产生短会话或半个会话
+            questions, quota_snapshot = await PracticeService._draw_quota_questions(
+                subject_id=subject_id,
+                knowledge_ids=knowledge_ids,
+                quota_counts=quota_counts
+            )
+        elif mode == "random":
             questions = await QuestionService.get_random_questions(
                 subject_id=subject_id,
                 knowledge_ids=knowledge_ids,
@@ -40,7 +71,7 @@ class PracticeService:
             raise ValueError("没有找到符合条件的题目")
 
         question_ids = [str(q["_id"]) for q in questions]
-        session_dict = {
+        session_dict: Dict[str, Any] = {
             "user_id": user_id,
             "mode": mode,
             "subject_id": subject_id,
@@ -53,6 +84,9 @@ class PracticeService:
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
+        # 创建成功后按题号快照继续：把配额与实际补位结果一并固化到会话
+        if quota_snapshot is not None:
+            session_dict["quota"] = quota_snapshot
 
         result = await db.practice_sessions.insert_one(session_dict)
         session_dict["_id"] = str(result.inserted_id)
@@ -60,9 +94,174 @@ class PracticeService:
 
         if redis:
             key = f"practice:{user_id}:{str(result.inserted_id)}"
-            await redis.setex(key, 3600 * 24, json.dumps(session_dict))
+            await redis.setex(key, 3600 * 24, json.dumps(session_dict, default=str))
 
         return session_dict
+
+    @staticmethod
+    def _parse_quota_counts(
+        mode: str,
+        question_count: int,
+        easy_count: Optional[int],
+        medium_count: Optional[int],
+        hard_count: Optional[int]
+    ) -> Optional[Dict[str, int]]:
+        """校验三档配额入参，返回 {easy, medium, hard}，未走配额模式时返回 None。"""
+        raw = {
+            "easy": easy_count,
+            "medium": medium_count,
+            "hard": hard_count
+        }
+        provided = [value for value in raw.values() if value is not None]
+        if not provided:
+            return None
+
+        if mode != "random":
+            raise ValueError("按难度配额抽题仅支持随机练习模式")
+        if any(value is None for value in raw.values()):
+            raise ValueError("请同时填写简单、中等、困难三档题数")
+        if any(value < 0 for value in raw.values()):
+            raise ValueError("各难度题数不能为负数")
+
+        quota_counts = {level: int(raw[level]) for level in DIFFICULTY_LEVELS}
+        total = sum(quota_counts.values())
+        if total != question_count:
+            raise ValueError(
+                f"三档题数之和（{total}）必须等于总题数（{question_count}）"
+            )
+        if total <= 0:
+            raise ValueError("总题数必须大于 0")
+        return quota_counts
+
+    @staticmethod
+    async def _draw_quota_questions(
+        subject_id: str,
+        knowledge_ids: Optional[List[str]],
+        quota_counts: Dict[str, int]
+    ):
+        """按难度配额抽题的全部业务：余量统计 → 补位 → 整批校验 → 抽样。"""
+        available = await QuestionService.count_questions_by_difficulty(
+            subject_id, knowledge_ids
+        )
+        requested = {level: quota_counts[level] for level in DIFFICULTY_LEVELS}
+        total_requested = sum(requested.values())
+
+        # 各档先用本档题，缺口等待有余量的档补位。
+        # allocated：实际从该档题库抽出的题数（补位会多抽）
+        # covered：该档需求已被满足的题数（含其他档补入）
+        allocated = {
+            level: min(requested[level], available[level])
+            for level in DIFFICULTY_LEVELS
+        }
+        covered = dict(allocated)
+        transfers: List[Dict[str, str | int]] = []
+
+        # 对每个缺档，按 中等→简单→困难 的顺序从有余量的档借题；
+        # 借位档跳过缺档自身
+        for deficit_level in DIFFICULTY_LEVELS:
+            need = requested[deficit_level] - covered[deficit_level]
+            if need <= 0:
+                continue
+
+            for donor in FILL_ORDER:
+                if need == 0:
+                    break
+                if donor == deficit_level:
+                    continue
+                surplus = available[donor] - allocated[donor]
+                if surplus <= 0:
+                    continue
+                take = min(need, surplus)
+                allocated[donor] += take
+                covered[deficit_level] += take
+                need -= take
+                transfers.append({
+                    "from_difficulty": donor,
+                    "to_difficulty": deficit_level,
+                    "count": take
+                })
+
+        # 补足后仍缺题：整批拒绝，返回每档需求、可用数和缺口
+        shortage = {
+            level: requested[level] - covered[level]
+            for level in DIFFICULTY_LEVELS
+            if covered[level] < requested[level]
+        }
+        total_shortage = sum(shortage.values())
+        if total_shortage > 0:
+            levels_detail = {
+                level: {
+                    "requested": requested[level],
+                    "available": available[level],
+                    "shortage": requested[level] - covered[level]
+                }
+                for level in DIFFICULTY_LEVELS
+            }
+            raise QuotaShortageError({
+                "code": "QUOTA_SHORTAGE",
+                "message": "题库余量不足，无法按难度配额凑齐本次练习，已整批取消",
+                "total_requested": total_requested,
+                "total_available": sum(available.values()),
+                "total_shortage": total_shortage,
+                "levels": levels_detail
+            })
+
+        # 逐档抽样并排除已抽中的题号，保证同一会话题号不重复
+        questions: List[dict] = []
+        used_ids: List[str] = []
+        for level in DIFFICULTY_LEVELS:
+            need = allocated[level]
+            if need <= 0:
+                continue
+            picked = await QuestionService.sample_questions_by_difficulty(
+                subject_id=subject_id,
+                difficulty=level,
+                count=need,
+                knowledge_ids=knowledge_ids,
+                exclude_ids=used_ids
+            )
+            if len(picked) != need:
+                # 并发等原因导致余量变化，为避免短会话同样整批拒绝
+                raise QuotaShortageError({
+                    "code": "QUOTA_SHORTAGE",
+                    "message": "抽题过程中题库余量发生变化，已整批取消，请重试",
+                    "total_requested": total_requested,
+                    "total_available": sum(available.values()),
+                    "total_shortage": total_requested - len(used_ids) - len(picked),
+                    "levels": {
+                        level: {
+                            "requested": requested[level],
+                            "available": available[level],
+                            "shortage": requested[level] - covered[level]
+                        }
+                        for level in DIFFICULTY_LEVELS
+                    }
+                })
+            used_ids.extend(str(q["_id"]) for q in picked)
+            questions.extend(picked)
+
+        # 打乱快照顺序，避免简单/中等/困难各成一坨
+        random.shuffle(questions)
+
+        received = {level: 0 for level in DIFFICULTY_LEVELS}
+        for transfer in transfers:
+            received[transfer["to_difficulty"]] += transfer["count"]
+
+        quota_snapshot = {
+            "total_requested": total_requested,
+            "total_available": sum(available.values()),
+            "levels": {
+                level: {
+                    "requested": requested[level],
+                    "available": available[level],
+                    "allocated": allocated[level],
+                    "filled": received[level]
+                }
+                for level in DIFFICULTY_LEVELS
+            },
+            "transfers": transfers
+        }
+        return questions, quota_snapshot
 
     @staticmethod
     async def get_session(session_id: str, user_id: str) -> Optional[dict]:
@@ -87,7 +286,7 @@ class PracticeService:
             session["_id"] = str(session["_id"])
             if redis:
                 key = f"practice:{user_id}:{session_id}"
-                await redis.setex(key, 3600 * 24, json.dumps(session))
+                await redis.setex(key, 3600 * 24, json.dumps(session, default=str))
 
         return session
 
@@ -148,7 +347,7 @@ class PracticeService:
         session.update(update_data)
         if redis:
             key = f"practice:{user_id}:{session_id}"
-            await redis.setex(key, 3600 * 24, json.dumps(session))
+            await redis.setex(key, 3600 * 24, json.dumps(session, default=str))
 
         progress = {
             "current": session["current_index"],
@@ -229,7 +428,7 @@ class PracticeService:
         session["current_index"] = new_index
         if redis:
             key = f"practice:{user_id}:{session_id}"
-            await redis.setex(key, 3600 * 24, json.dumps(session))
+            await redis.setex(key, 3600 * 24, json.dumps(session, default=str))
 
         if 0 <= new_index < len(question_ids):
             return await QuestionService.get_question_by_id(question_ids[new_index])

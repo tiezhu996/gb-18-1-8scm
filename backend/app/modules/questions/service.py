@@ -9,6 +9,9 @@ from app.modules.questions.models import (
 
 
 class QuestionService:
+    # 难度三档，随机练习按难度配额抽题时统一使用该顺序
+    DIFFICULTY_LEVELS = ("easy", "medium", "hard")
+
     @staticmethod
     def to_response(question: dict) -> dict:
         return {
@@ -99,6 +102,68 @@ class QuestionService:
         ]
         questions = await db.questions.aggregate(pipeline).to_list(length=count)
         return questions
+
+    @staticmethod
+    def build_practice_filter(
+        subject_id: str,
+        knowledge_ids: Optional[List[str]] = None,
+        difficulty: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """构造随机抽题的基础过滤条件，配额抽题与余量统计共用。"""
+        query: Dict[str, Any] = {"subject_id": subject_id}
+        if knowledge_ids:
+            query["knowledge_ids"] = {"$in": knowledge_ids}
+        if difficulty:
+            query["difficulty"] = difficulty
+        return query
+
+    @staticmethod
+    async def count_questions_by_difficulty(
+        subject_id: str,
+        knowledge_ids: Optional[List[str]] = None
+    ) -> Dict[str, int]:
+        """统计学科/知识点范围内简单、中等、困难三档各自的可用题数。"""
+        db = get_db()
+        base_query = QuestionService.build_practice_filter(subject_id, knowledge_ids)
+        counts = {level: 0 for level in QuestionService.DIFFICULTY_LEVELS}
+
+        for level in QuestionService.DIFFICULTY_LEVELS:
+            query = {**base_query, "difficulty": level}
+            counts[level] = await db.questions.count_documents(query)
+        return counts
+
+    @staticmethod
+    async def sample_questions_by_difficulty(
+        subject_id: str,
+        difficulty: str,
+        count: int,
+        knowledge_ids: Optional[List[str]] = None,
+        exclude_ids: Optional[List[str]] = None
+    ) -> List[dict]:
+        """
+        在指定难度档内随机抽题，并排除本批次已经抽出的题号，
+        保证同一会话内题题号不重复。
+        """
+        db = get_db()
+        query = QuestionService.build_practice_filter(
+            subject_id, knowledge_ids, difficulty
+        )
+
+        if exclude_ids:
+            exclude_object_ids = [
+                ObjectId(qid) for qid in exclude_ids if ObjectId.is_valid(qid)
+            ]
+            if exclude_object_ids:
+                query["_id"] = {"$nin": exclude_object_ids}
+
+        if count <= 0:
+            return []
+
+        pipeline = [
+            {"$match": query},
+            {"$sample": {"size": count}}
+        ]
+        return await db.questions.aggregate(pipeline).to_list(length=count)
 
     @staticmethod
     async def get_questions_by_ids(question_ids: List[str]) -> List[dict]:

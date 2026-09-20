@@ -63,6 +63,51 @@ export interface PracticeSession {
   answers: Record<string, any>
   total: number
   correct_count: number
+  quota?: QuotaReport
+}
+
+// 随机练习按难度配额抽题相关类型
+export type DifficultyLevel = 'easy' | 'medium' | 'hard'
+
+export interface QuotaCounts {
+  easy: number
+  medium: number
+  hard: number
+}
+
+export interface QuotaLevelStat {
+  requested: number
+  available: number
+  allocated: number
+  filled: number
+}
+
+export interface QuotaTransfer {
+  from_difficulty: DifficultyLevel
+  to_difficulty: DifficultyLevel
+  count: number
+}
+
+export interface QuotaReport {
+  total_requested: number
+  total_available: number
+  levels: Record<DifficultyLevel, QuotaLevelStat>
+  transfers: QuotaTransfer[]
+}
+
+export interface QuotaShortageLevel {
+  requested: number
+  available: number
+  shortage: number
+}
+
+export interface QuotaShortageDetail {
+  code: 'QUOTA_SHORTAGE'
+  message: string
+  total_requested: number
+  total_available: number
+  total_shortage: number
+  levels: Record<DifficultyLevel, QuotaShortageLevel>
 }
 
 export interface PracticeResult {
